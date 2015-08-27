@@ -5,14 +5,15 @@ require 'json'
 
 # Prerequisities
 #
-# 1. There's a DNS A record pointing *.staging.yniche.com to the staging cluster.
+# 1. There's a DNS CNAME record pointing whatever URL Tutum exposed for
+#    the staging load balancer.
 #
 # Workflow
 #
 # 1. Push a feature branch to GH -> CI.
 # 2. On success:
-#   a) Image is being tagged with 'staging'
-#   b) Pushed to Tutum registry.
+#   a) Image is being tagged with the branch name (or 'latest' for master).
+#   b) Image is pushed to the Tutum registry.
 #   c) The tutum utility is called with --name=<your topic branch>.
 #
 # Caveats
@@ -23,27 +24,43 @@ require 'json'
 #
 # Examples
 #
-# ./bin/deploy.rb linkedin-auth
+# ./bin/deploy.rb linkedin-auth/staging-web
 #   => linkedin-auth.staging.yniche.com
 #
-# ./bin/deploy.rb production
-#   => yniche.com
+# ./bin/deploy.rb master/staging-web:latest
+#   => master.staging.yniche.com # Usually not necessary, master should == prod.
 
-BRANCH_NAME = ARGV.shift || abort('! Branch name required.')
-ENVIRONMENT = (BRANCH_NAME == 'production') ? 'production' : 'staging'
-STACK_NAME  = "yniche-#{ENVIRONMENT}-#{BRANCH_NAME}"
-LOCKED_API_TAG = ARGV.shift || (ENVIRONMENT == 'production' ? 'production' : 'latest')
-API_IMAGE = 'tutum.co/yniche/api.yniche.com'
+deployed_service = ARGV.shift || abort('! Deployed service name required.')
 
-DEFINITION_VARIABLES = Hash.new { |hash, key| raise NoSuchKeyError.new(key) }
-DEFINITION_VARIABLES['LOCKED_API_TAG'] = LOCKED_API_TAG
-DEFINITION_VARIABLES['LOCKED_WEB_TAG'] = BRANCH_NAME
-DEFINITION_VARIABLES['BRANCH'] = BRANCH_NAME
+SHORT_NAME = deployed_service.split('/')[0] || abort('! Deployed service name is must be stack_name/deployed_service.')
+STACK_NAME  = "yniche-#{SHORT_NAME}"
+SOLO_STACK_NAME = 'yniche-staging-shared-services' # If you change this, you have to change your DNS, because the Tutum-exposed URL will change.
+DEPLOYED_SERVICE = "#{deployed_service.split('/')[1]}.#{STACK_NAME}"
+
+unless ARGV.empty?
+  abort '! Only one argument (the name) expected.'
+end
+
+# LOCKED_API_TAG=auth0
+DEFINITION_VARIABLES = Hash.new do |hash, key|
+  if key.match(/^LOCKED_.+_TAG$/)
+    hash[key] = ENV[key] || 'latest'
+  else
+    raise NoSuchKeyError.new(key)
+  end
+end
+
+DEFINITION_VARIABLES['LOCKED_APP_TAG'] = SHORT_NAME
+DEFINITION_VARIABLES['SHORT_NAME'] = SHORT_NAME
 
 class NoSuchKeyError < StandardError
   attr_reader :key
   def initialize(key)
     @key = key
+  end
+
+  def message
+    "Unsupported key #{self.key}."
   end
 end
 
@@ -56,8 +73,8 @@ def deploy(stack_name, base_stackfile_path, stackfile_path)
   # 1. Build the image, tag it with yniche/yniche.com:<branch_name> and push it.
   #    We have autoredeploy, so the images gets restarted automatically.
   #    This has to happen first, otherwise deploying the stack will fail (no kidding, right?).
-  tag = (BRANCH_NAME == 'master') ? 'latest' : BRANCH_NAME
-  full_image_name = "yniche/yniche.com:#{DEFINITION_VARIABLES['LOCKED_WEB_TAG']}"
+  tag = (SHORT_NAME == 'master') ? 'latest' : SHORT_NAME
+  full_image_name = "yniche/yniche.com:#{DEFINITION_VARIABLES['LOCKED_APP_TAG']}"
   # Assuming build already took place. This is just a deployment script.
   # run "docker build -t tutum.co/#{full_image_name} .."
   # If the following step fails, do docker-machine ssh yniche and remove the first
@@ -71,31 +88,34 @@ def deploy(stack_name, base_stackfile_path, stackfile_path)
   # tutum push yniche/yniche.com:auth0
 
   # 2. Generate the stack definition from a base stack file.
-  validate_api_tag_name(LOCKED_API_TAG)
-  generate_stackfile(base_stackfile_path, stackfile_path)
+  if base_stackfile_path
+    generate_stackfile(base_stackfile_path, stackfile_path)
+  end
 
   # 3. Create (or update if neccessary) a new stack with given name.
-  stack = `tutum stack list`.split("\n").grep(Regexp.new("^#{stack_name}\s"))[0]
+  stacks = `tutum stack list`.split("\n").grep(Regexp.new("^#{stack_name}\s"))
+  p stacks
+  stack = stacks.select { |stack_line| ! stack_line.match(/Terminated/) }[0]
   if stack
-    warn <<-EOF
-
-Stack #{stack_name} already exist. If you just want to update the code:
-
-  docker build -t tutum.co/yniche/yniche.com:#{BRANCH_NAME} ..
-  docker push tutum.co/yniche/yniche.com:#{BRANCH_NAME}
-
-Similarly, if you just want to update the API, rebuild & repush.
-As long as you are not going to change the LOCKED_API_TAG,
-all should be fine (although you need to restart the web service
-manually, the restarts don't cascade up).
-
-The rest will be taken care by Tutum autoredeploys.
-Updating the stack definition makes sense only if
-
-  * One of the services was changed, deleted or new one was added.
-  * LOCKED_API_TAG was changed.
-
-    EOF
+#     warn <<-EOF
+#
+# Stack #{stack_name} already exist. If you just want to update the code:
+#
+#   docker build -t tutum.co/yniche/yniche.com:#{SHORT_NAME} ..
+#   docker push tutum.co/yniche/yniche.com:#{SHORT_NAME}
+#
+# Similarly, if you just want to update the API, rebuild & repush.
+# As long as you are not going to change the LOCKED_API_TAG,
+# all should be fine (although you need to restart the web service
+# manually, the restarts don't cascade up).
+#
+# The rest will be taken care by Tutum autoredeploys.
+# Updating the stack definition makes sense only if
+#
+#   * One of the services was changed, deleted or new one was added.
+#   * LOCKED_API_TAG was changed.
+#
+#     EOF
 
     run "tutum stack update -f #{stackfile_path} #{stack.split(' ')[1]}"
 
@@ -105,22 +125,26 @@ Updating the stack definition makes sense only if
   end
 end
 
-def validate_api_tag_name(locked_api_tag)
-  api_image_data = JSON.parse(`tutum image inspect #{API_IMAGE}`)
-  api_image_tags = api_image_data['tags'].map { |tag_url| tag_url.split('/').last }
-  unless api_image_tags.include?(locked_api_tag)
-    abort("! Tag #{locked_api_tag} doesn't exist in api.yniche.com. Available tags are: #{api_image_tags.inspect}")
-  end
-end
+# TODO: Rewrite to be generic. (List your repos | filter)
+# API_IMAGE = 'tutum.co/yniche/api.yniche.com' # Not generic.
+# def validate_api_tag_name(locked_api_tag)
+#   api_image_data = JSON.parse(`tutum image inspect #{API_IMAGE}`)
+#   api_image_tags = api_image_data['tags'].map { |tag_url| tag_url.split('/').last }
+#   unless api_image_tags.include?(locked_api_tag)
+#     abort("! Tag #{locked_api_tag} doesn't exist in api.yniche.com. Available tags are: #{api_image_tags.inspect}")
+#   end
+# end
 
 def generate_stackfile(base_stackfile_path, stackfile_path)
   base_definition = YAML.load_file(base_stackfile_path)
   base_definition.delete('defaults')
-  definition = base_definition.to_yaml.gsub(/<%=\s*(\w+)\s*%>/) do |match|
+  definition = base_definition.to_yaml.gsub(/"?<%=\s*(\w+)\s*%>"?/) do |match|
     begin
-      DEFINITION_VARIABLES[$1]
+      value = DEFINITION_VARIABLES[$1]
+      puts "  ~> Replacing #{$1} with #{value.inspect}."
+      value
     rescue NoSuchKeyError => error
-      abort("! Unsupported variable in #{base_stackfile_path}: #{error.key}")
+      abort("! Error in #{base_stackfile_path}: #{error.message}")
     end
   end
 
@@ -130,17 +154,63 @@ def generate_stackfile(base_stackfile_path, stackfile_path)
 end
 
 # Main.
-if BRANCH_NAME == 'production'
-  puts "~ Doing PRODUCTION deploy (locked to api.yniche.com:#{LOCKED_API_TAG})."
-  puts <<-EOF
+# No longer providing production deployments.
+# if SHORT_NAME == 'production'
+#   puts "~ Doing PRODUCTION deploy (locked to api.yniche.com:#{LOCKED_API_TAG})."
+#   puts <<-EOF
+#
+# Checklist:
+# - Have you updated 'production' tag on yniche.com and pushed it?
+# - Have you updated 'production' tag on api.yniche.com and pushed it?
+#
+#   EOF
+#   deploy('yniche-production', 'production.template.yml', 'production.yml')
+puts "~ 1. Initial deployment to make sure the DB is there (we link it from the web & api services)."
 
-Checklist:
-- Have you updated 'production' tag on yniche.com and pushed it?
-- Have you updated 'production' tag on api.yniche.com and pushed it?
-
-  EOF
-  deploy('yniche-production', 'production.template.yml', 'production.yml')
-else
-  puts "~ Deploying #{BRANCH_NAME} to staging (locked to api.yniche.com:#{LOCKED_API_TAG})."
-  deploy(STACK_NAME, 'staging.template.yml', 'staging.yml')
+lb_links = begin
+  load_balancer_info = JSON.parse(`tutum service inspect staging-lb.yniche-staging-shared-services`)
+  ids = load_balancer_info['linked_to_service'].map { |node| node['to_service'].split('/').last }
+  ids.map do |id|
+    # To get the full stack_name.service_name.
+    public_dns = JSON.parse(`tutum service inspect #{id}`)['public_dns']
+    service_name, stack_name = public_dns.split('.')[0..1]
+    "#{service_name}.#{stack_name}:#{stack_name}"
+  end
+rescue
+  Array.new
 end
+
+DEFINITION_VARIABLES['LB_LINKS'] = lb_links.inspect
+
+if File.exist?('staging.solo.template.yml')
+  deploy(SOLO_STACK_NAME, 'staging.solo.template.yml', 'staging.solo.yml')
+else
+  puts '~ File staging.solo.template.yml has not been found, assuming the common services are up and running already.'
+end
+
+puts "~ 2. Deploying #{SHORT_NAME} to staging (vars: #{DEFINITION_VARIABLES.inspect})."
+deploy(STACK_NAME, 'staging.stack.template.yml', "#{STACK_NAME}.yml")
+
+puts '~ 3. Stack deployed. Linking to the load balancer ...'
+if File.exist?('staging.solo.template.yml')
+  # TODO: This branch will be obsolete when I finish the else branch (which has to exist because of the api, which doesn't have the whole solo template). And in that case let's just go with this rather than having both.
+  service_name, stack_name = DEPLOYED_SERVICE.split('.')
+  named_deployed_service = "#{service_name}.#{stack_name}:#{stack_name}"
+  DEFINITION_VARIABLES['LB_LINKS'] = ((lb_links << named_deployed_service).uniq).inspect
+  deploy(SOLO_STACK_NAME, 'staging.solo.template.yml', 'staging.solo.yml')
+else
+  # There's 'None' as the first line. God knows why.
+  `tutum stack export yniche-staging-shared-services > export.tmp.yml`
+  valid_yaml = File.readlines('export.tmp.yml')[1..-1].join('')
+  stack = YAML.load(valid_yaml)
+  service_name, stack_name = DEPLOYED_SERVICE.split('.')
+  stack['staging-lb']['links'] = stack['staging-lb']['links'].push("#{service_name}.#{stack_name}:#{stack_name}").uniq
+  File.write('staging.solo.yml', 'w') { |f| f.write(stack.to_yaml) }
+  deploy(SOLO_STACK_NAME, nil, 'staging.solo.yml')
+end
+
+# This shouldn't be necessary. LB has role global and should reconfigure itself from the Tutum API, but it's not happening.
+run 'tutum service redeploy staging-lb.yniche-staging-shared-services'
+# system 'sudo killall -HUP mDNSResponder' ## Why the bloody fuck do I need this?
+
+puts '~ Done and done! Now you have to wait for a bit. No idea why, but it will take about 5 min. Clearning the DNS cache does not help. Only for the first service though, from there on it works immediately.'
