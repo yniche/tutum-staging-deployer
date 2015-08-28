@@ -50,7 +50,7 @@ DEFINITION_VARIABLES = Hash.new do |hash, key|
   end
 end
 
-DEFINITION_VARIABLES['LOCKED_APP_TAG'] = SHORT_NAME
+DEFINITION_VARIABLES['LOCKED_WEB_TAG'] = SHORT_NAME
 DEFINITION_VARIABLES['SHORT_NAME'] = SHORT_NAME
 
 class NoSuchKeyError < StandardError
@@ -74,7 +74,7 @@ def deploy(stack_name, base_stackfile_path, stackfile_path)
   #    We have autoredeploy, so the images gets restarted automatically.
   #    This has to happen first, otherwise deploying the stack will fail (no kidding, right?).
   tag = (SHORT_NAME == 'master') ? 'latest' : SHORT_NAME
-  full_image_name = "yniche/yniche.com:#{DEFINITION_VARIABLES['LOCKED_APP_TAG']}"
+  full_image_name = "yniche/yniche.com:#{DEFINITION_VARIABLES['LOCKED_WEB_TAG']}"
   # Assuming build already took place. This is just a deployment script.
   # run "docker build -t tutum.co/#{full_image_name} .."
   # If the following step fails, do docker-machine ssh yniche and remove the first
@@ -94,7 +94,6 @@ def deploy(stack_name, base_stackfile_path, stackfile_path)
 
   # 3. Create (or update if neccessary) a new stack with given name.
   stacks = `tutum stack list`.split("\n").grep(Regexp.new("^#{stack_name}\s"))
-  p stacks
   stack = stacks.select { |stack_line| ! stack_line.match(/Terminated/) }[0]
   if stack
 #     warn <<-EOF
@@ -174,7 +173,8 @@ lb_links = begin
     # To get the full stack_name.service_name.
     public_dns = JSON.parse(`tutum service inspect #{id}`)['public_dns']
     service_name, stack_name = public_dns.split('.')[0..1]
-    "#{service_name}.#{stack_name}:#{stack_name}"
+    label = service_name.sub(/^staging-/, '')
+    "#{service_name}.#{stack_name}:#{label}-#{stack_name}"
   end
 rescue
   Array.new
@@ -188,29 +188,43 @@ else
   puts '~ File staging.solo.template.yml has not been found, assuming the common services are up and running already.'
 end
 
-puts "~ 2. Deploying #{SHORT_NAME} to staging (vars: #{DEFINITION_VARIABLES.inspect})."
+puts "~ 2. Deploying #{SHORT_NAME} to staging"
 deploy(STACK_NAME, 'staging.stack.template.yml', "#{STACK_NAME}.yml")
+puts "Variables: #{DEFINITION_VARIABLES.inspect})." # Has to be a posteriori due to the hash default block setting vars.
 
 puts '~ 3. Stack deployed. Linking to the load balancer ...'
-if File.exist?('staging.solo.template.yml')
-  # TODO: This branch will be obsolete when I finish the else branch (which has to exist because of the api, which doesn't have the whole solo template). And in that case let's just go with this rather than having both.
+# if File.exist?('staging.solo.template.yml')
+
   service_name, stack_name = DEPLOYED_SERVICE.split('.')
-  named_deployed_service = "#{service_name}.#{stack_name}:#{stack_name}"
-  DEFINITION_VARIABLES['LB_LINKS'] = ((lb_links << named_deployed_service).uniq).inspect
+  label = service_name.sub(/^staging-/, '')
+  named_deployed_service = "#{service_name}.#{stack_name}:#{label}-#{stack_name}"
+  p DEFINITION_VARIABLES
+  linked_services = DEFINITION_VARIABLES.reduce(Array.new) do |buffer, (key, value)|
+    if key.match(/^LOCKED_(.+)_TAG$/)
+      service_name = "staging-#{$1.downcase}"
+      buffer << "#{service_name}.#{stack_name}:#{$1.downcase}-#{stack_name}"
+    end
+
+    buffer
+  end
+  DEFINITION_VARIABLES['LB_LINKS'] = (((lb_links + linked_services) << named_deployed_service).uniq).inspect
   deploy(SOLO_STACK_NAME, 'staging.solo.template.yml', 'staging.solo.yml')
-else
-  # There's 'None' as the first line. God knows why.
-  `tutum stack export yniche-staging-shared-services > export.tmp.yml`
-  valid_yaml = File.readlines('export.tmp.yml')[1..-1].join('')
-  stack = YAML.load(valid_yaml)
-  service_name, stack_name = DEPLOYED_SERVICE.split('.')
-  stack['staging-lb']['links'] = stack['staging-lb']['links'].push("#{service_name}.#{stack_name}:#{stack_name}").uniq
-  File.write('staging.solo.yml', 'w') { |f| f.write(stack.to_yaml) }
-  deploy(SOLO_STACK_NAME, nil, 'staging.solo.yml')
-end
+# else
+#   # Actually I realised this is unnecessary. We deploy from one place only and
+#   # that's the frontend. API just pushes new Docker tags.
+#   #
+#   # There's 'None' as the first line. God knows why.
+#   `tutum stack export yniche-staging-shared-services > export.tmp.yml`
+#   valid_yaml = File.readlines('export.tmp.yml')[1..-1].join('')
+#   stack = YAML.load(valid_yaml)
+#   service_name, stack_name = DEPLOYED_SERVICE.split('.')
+#   stack['staging-lb']['links'] = stack['staging-lb']['links'].push("#{service_name}.#{stack_name}:#{stack_name}").uniq
+#   File.write('staging.solo.yml', 'w') { |f| f.write(stack.to_yaml) }
+#   deploy(SOLO_STACK_NAME, nil, 'staging.solo.yml')
+# end
 
 # This shouldn't be necessary. LB has role global and should reconfigure itself from the Tutum API, but it's not happening.
 run 'tutum service redeploy staging-lb.yniche-staging-shared-services'
 # system 'sudo killall -HUP mDNSResponder' ## Why the bloody fuck do I need this?
 
-puts '~ Done and done! Now you have to wait for a bit. No idea why, but it will take about 5 min. Clearning the DNS cache does not help. Only for the first service though, from there on it works immediately.'
+puts '~ Done and done! Now you have to wait for a bit. No idea why, but it will take about 5 min. Clearing the DNS cache does not help. Only for the first service though, from there on it works immediately.'
