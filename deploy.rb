@@ -225,6 +225,6 @@ puts '~ 3. Stack deployed. Linking to the load balancer ...'
 
 # This shouldn't be necessary. LB has role global and should reconfigure itself from the Tutum API, but it's not happening.
 run 'tutum service redeploy staging-lb.yniche-staging-shared-services'
-# system 'sudo killall -HUP mDNSResponder' ## Why the bloody fuck do I need this?
+system 'sudo killall -HUP mDNSResponder' ## Why the bloody fuck do I need this?
 
-puts '~ Done and done! Now you have to wait for a bit. No idea why, but it will take about 5 min. Clearing the DNS cache does not help. Only for the first service though, from there on it works immediately.'
+puts '~ Done and done! Now you have to wait for a bit. No idea why, but it will take about 5 min. Clearing the DNS cache does not help. EDIT - it does, but you have to wait a bit apparently. Only for the first service though, from there on it works immediately.'
